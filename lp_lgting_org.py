@@ -42,6 +42,12 @@ import warnings
 # remove all warnings
 warnings.filterwarnings("ignore")
 
+
+"""
+Do you understand the code ? answer very shortly
+
+converted this code to pytorch lighting? is the conversion okay? or does it have any mistake for which the result could show difference .
+"""
 class SAGE(nn.Module):
     def __init__(self, in_size, hid_size, num_layers=3):
         super().__init__()
@@ -248,13 +254,32 @@ class GraphLinkPredictionDataModule(pl.LightningDataModule):
             drop_last=False, num_workers=0, use_uva=use_uva)
 
 
+    # --- ADD THESE METHODS ---
+    def val_dataloader(self):
+        # The validation step is a no-op, and evaluation happens on the full graph.
+        # Returning the train_dataloader is acceptable here to trigger the validation hooks.
+        use_uva = (self.cfg.mode == 'mixed')
+        return DataLoader(
+            self.graph, self.seed_edges, self.sampler,
+            device=self.device_str, batch_size=self.cfg.batch_size, shuffle=False,
+            drop_last=False, num_workers=0, use_uva=use_uva)
+
+    def test_dataloader(self):
+        use_uva = (self.cfg.mode == 'mixed')
+        return DataLoader(
+            self.graph, self.seed_edges, self.sampler,
+            device=self.device_str, batch_size=self.cfg.batch_size, shuffle=False,
+            drop_last=False, num_workers=0, use_uva=use_uva)
+    
+
 class GraphLinkPredictionModule(pl.LightningModule):
-    def __init__(self, cfg, in_size, graph, edge_split, eval_batch_size=1000):
+    def __init__(self, cfg, in_size, graph, edge_split,total_it, eval_batch_size=1000):
         super().__init__()
         self.cfg = cfg
+        self.total_it= total_it
+        self.should_evaluate = False
         self.save_hyperparameters(ignore=['graph', 'edge_split'])
-        
-        # Initialize model
+
         if cfg.model_name == "SAGE":
             self.model = SAGE(in_size, cfg.hidden_dim, cfg.num_layers)
         else:
@@ -282,7 +307,6 @@ class GraphLinkPredictionModule(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
             },
         }
     
@@ -304,13 +328,17 @@ class GraphLinkPredictionModule(pl.LightningModule):
         accum_iter = self.cfg.accum_iter_number
         (loss / accum_iter).backward()
         
-        # Update optimizer based on accumulation
-        if (batch_idx + 1) % accum_iter == 0:
+
+        # Get the actual number of batches in this epoch
+        num_batches = self.trainer.num_training_batches
+        if ((batch_idx + 1) % accum_iter == 0) or (batch_idx + 1 == num_batches):
             opt.step()
             opt.zero_grad()
-            
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=self.cfg.batch_size)
+                            
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=self.cfg.batch_size)
         self.log('learning_rate', sch.get_last_lr()[0], on_step=True, on_epoch=True, batch_size=self.cfg.batch_size)
+
+
         
         return loss
     
@@ -318,21 +346,15 @@ class GraphLinkPredictionModule(pl.LightningModule):
         sch = self.lr_schedulers()
         sch.step()
     
-    def validation_step(self, batch, batch_idx):
-        # For validation, we'll do full graph inference
-        return None
-    
-    def on_validation_epoch_end(self):
-        if (self.current_epoch + 1) % self.cfg.log_steps == 0:
+        if (self.current_epoch + 1) % self.cfg.log_steps == 0 or self.should_evaluate:
             self._evaluate_model()
     
     def _evaluate_model(self):
+          
         """Perform full model evaluation"""
         self.model.eval()
         with torch.no_grad():
             node_emb = self.model.inference(self.graph, self.device, self.eval_batch_size)
-            
-            # Evaluate on training subset
             torch.manual_seed(12345)
             num_sampled_nodes = self.edge_split['valid']['target_node_neg'].size(dim=0)
             idx = torch.randperm(self.edge_split['train']['source_node'].numel())[:num_sampled_nodes]
@@ -398,20 +420,7 @@ class GraphLinkPredictionModule(pl.LightningModule):
                     self.log('best_test_mrr', self.best_test_result, on_epoch=True)
                     self.log('best_epoch', self.current_epoch, on_epoch=True)
     
-    def test_step(self, batch, batch_idx):
-        return None
-    
-    def on_test_epoch_end(self):
-        self._evaluate_model()
-        return self.best_test_result
 
-    def val_dataloader(self):
-        # For validation, we do full graph inference, so return same as train
-        return self.train_dataloader()
-    
-    def test_dataloader(self):
-        # For testing, we do full graph 
-        return self.train_dataloader()
 
 
 PROJETC_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -422,16 +431,14 @@ log = logging.getLogger(__name__)
 
 @hydra.main(config_path=CONFIG_DIR, config_name="defaults", version_base='1.2')
 def main(cfg: DictConfig):
-    # Set up logging
-    pl.seed_everything(42)
-    
+
     log.info('Loading data')
     data_path = '/home/kbhau001/llm/mm-graph-benchmark/Multimodal-Graph-Completed-Graph/'
     dataset_name = 'books-lp'
     feat_name = 't5vit'
     edge_split_type = 'hard'
     verbose = True
-    device = ('cuda' if cfg.mode == 'puregpu' else 'cpu')
+    device = ('cuda:'+str(cfg.gpu_id) if cfg.mode == 'puregpu' else 'cpu')
 
     dataset = LinkPredictionDataset(
         root=os.path.join(data_path, dataset_name),
@@ -446,7 +453,7 @@ def main(cfg: DictConfig):
     g = dgl.remove_self_loop(g)
     log.info("remove isolated nodes")
     g, reverse_eids = to_bidirected_with_reverse_mapping(g)
-    g = g.to('cuda' if cfg.mode == 'puregpu' else 'cpu')
+    g = g.to('cuda:'+str(cfg.gpu_id) if cfg.mode == 'puregpu' else 'cpu')
     num_nodes = g.number_of_nodes()
     reverse_eids = reverse_eids.to(device)
     seed_edges = torch.arange(g.num_edges()).to(device)
@@ -484,7 +491,7 @@ def main(cfg: DictConfig):
     # Set up logger
     logger = None
     if cfg.get('use_logger', True):  # Default to True if not specified
-        experiment_name = "lightning_base" #f"{cfg.model_name}_{dataset_name}_{feat_name}"
+        experiment_name = "lightning_base_new" #f"{cfg.model_name}_{dataset_name}_{feat_name}"
         logger = WandbLogger(
             project="graph-link-prediction",
             name=experiment_name,
@@ -501,32 +508,25 @@ def main(cfg: DictConfig):
         # Update logger for this run if using logger
         if logger is not None:
             logger.experiment.name = f"{experiment_name}_run_{run}"
+  
+        data_module = GraphLinkPredictionDataModule(cfg, g, edge_split, reverse_eids, seed_edges, device)
+        total_it = int(1000 * 512 / cfg.batch_size)
+        model = GraphLinkPredictionModule(cfg, in_size, g, edge_split,total_it, eval_batch_size=1000)
         
-        # Create data module
-        data_module = GraphLinkPredictionDataModule(
-            cfg, g, edge_split, reverse_eids, seed_edges, device
-        )
-        
-        # Create model
-        model = GraphLinkPredictionModule(
-            cfg, in_size, g, edge_split, eval_batch_size=1000
-        )
-        
-        # Create trainer
         trainer = Trainer(
-            max_epochs=cfg.n_epochs,
+            max_epochs=cfg.n_epochs,        
+            limit_train_batches=total_it,
+            check_val_every_n_epoch=None,  
+            num_sanity_val_steps=0,        
             callbacks=callbacks,
             logger=logger,
-            accelerator='gpu' if cfg.mode == 'puregpu' else 'cpu',
-            devices=1,
+            accelerator='gpu',
+            devices=[cfg.gpu_id],
             log_every_n_steps=50,
-            check_val_every_n_epoch=cfg.log_steps,
             enable_checkpointing=False,
             enable_progress_bar=True,
             enable_model_summary=True,
-            # limit_train_batches=1,
-            # limit_predict_batches=1,
-            # limit_val_batches=1,
+            precision='32',
         )
         
         # Train model
